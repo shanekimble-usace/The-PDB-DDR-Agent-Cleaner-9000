@@ -1,96 +1,77 @@
 ---
-name: excel-date-standardizer
+name: excel-sheet-to-currency-csv
 description: >
-  Processes an uploaded file (Excel workbook with a specified sheet, or a direct CSV), identifies date columns using case-insensitive header keywords ('date', 'start', 'finish', 'last modified') and pattern inspection, normalizes mixed date formats (including '4-Sep-26', '9/1/26', 'MM/DD/YYYY', and timestamps) into standard ISO format (YYYY-MM-DD) using US date conventions (MM/DD/YYYY), and exports a single lightweight CSV file. Use this skill whenever a user asks to "standardize mixed date formats in Excel or CSV," "convert dates like 4-Sep-26 to YYYY-MM-DD," "clean schedule or finish dates," or "export standardized date CSV."
+  Extracts a user-specified sheet from an uploaded Excel workbook, converts numeric decimal columns into standard USD currency ($#,##0.00) while ignoring ID fields, and outputs solely that transformed sheet as a lightweight CSV file to bypass workbook memory and timeout limits. Use this skill whenever a user asks to "export an Excel sheet to CSV with currency formatting," "convert an Excel tab to currency CSV," "format numbers to dollars and export single sheet," or reports "timeout/runtime errors processing large Excel files."
 ---
 
-# Universal Tabular Date Standardizer
+# Excel Single Sheet to Currency CSV Converter
 
 ## What this skill is for
 
-This skill automates the identification and normalization of inconsistent, mixed-format date columns across tabular datasets. It ingests either an uploaded Excel file (`.xlsx`, `.xlsm`) with a user-specified sheet name or a standalone `.csv` file. It targets date columns by scanning headers for key indicators (`date`, `start`, `finish`, `last modified`) and inspecting cell contents. It reliably handles tricky mixed-string variations within the same column (such as `4-Sep-26` alongside `9/1/26`), resolves 2-digit years, parses ambiguous dates using US conventions (`Month/Day/Year`), converts all valid entries to standard `YYYY-MM-DD`, and writes out a single clean CSV file.
+This skill extracts and transforms a single user-specified sheet from large Excel workbooks directly into a CSV file with formatted currency columns (`$#,##0.00`). Large multi-tab workbooks frequently exceed session memory or compute timeouts when loaded and written back in full. By isolating only the required sheet and exporting to CSV, this skill delivers fast, memory-efficient transformations that eliminate runtime errors.
 
 ## What this skill will NOT do
 
-- This skill does not output multi-sheet Excel files; it outputs strictly a single `.csv` file.
-- This skill does not assume international date convention (`DD/MM/YYYY`) when dates are ambiguous; it strictly defaults to US format (`MM/DD/YYYY` where `9/1/26` means September 1, 2026).
-- This skill does not retain time or timezone components; all date values are standardized strictly to `YYYY-MM-DD`.
-- This skill does not alter columns that do not match the date header criteria or contain non-date data.
-- This skill does not guess the sheet name when an Excel workbook is provided without one.
+- This skill does not re-export or re-save the full multi-tab Excel workbook (`.xlsx`/`.xlsm`); it outputs strictly a single `.csv` file.
+- This skill does not modify columns whose header contains "ID" (case-insensitive) or whose numeric values are six-digit identifiers.
+- This skill does not process unrequested sheets in the workbook.
+- This skill does not make speculative assumptions about sheet names if the user fails to provide one or provides a name not present in the workbook.
 
 ## Connectors and knowledge sources
 
-This skill is instruction- and code-execution-based and does not require external connectors or document repositories. It processes user-uploaded files locally in the session environment using Python data libraries (`pandas`, `python-dateutil`).
+This skill is instruction- and code-execution-based and does not require external connectors or document repositories. It executes inside the session environment using Python data processing libraries (`pandas` or `openpyxl` in read-only mode).
 
 ## How to do the task
 
-### Step 1 — Ingest Input Data Efficiently
-Inspect the uploaded file extension:
+### Step 1 — Verify Sheet Name and Isolate Tab Efficiently
+Inspect the workbook to read available sheet names without loading full worksheet payloads into memory (e.g., using `openpyxl.load_workbook(filename, read_only=True, keep_links=False).sheetnames` or `pd.ExcelFile(path).sheet_names`).
+- Verify that the user's requested sheet exists in the workbook.
+- If missing or not specified, immediately stop and present the list of available sheets to the user.
+- Load ONLY the targeted sheet (e.g., via `pd.read_excel(file_path, sheet_name=target_sheet)`).
 
-| File Type | Ingestion Protocol |
-|---|---|
-| **CSV File (`.csv`)** | Load the file directly using `pd.read_csv()`, keeping text columns as strings (`dtype=str` or standard object types). Do not ask for a sheet name. |
-| **Excel File (`.xlsx`, `.xlsm`)** | Read sheet names using low-memory inspection (`openpyxl.load_workbook(filename, read_only=True).sheetnames` or `pd.ExcelFile(path).sheet_names`). If the user specified a sheet name, load ONLY that sheet. If missing or invalid, halt and prompt the user with the available sheets. |
+### Step 2 — Scan Columns for ID Exclusions and Decimals
+Examine the columns of the isolated sheet:
+1. Header exclusion: Check column names. If a column name contains `ID` (case-insensitive, e.g., "Employee ID", "Vendor_id", "ID_Code"), exclude it from formatting.
+2. Value pattern exclusion: Check integer/numeric columns where values are uniformly six digits long (e.g., `100000` to `999999`). Exclude these as system or employee identifiers.
+3. Decimal inclusion: Identify columns of numeric float type containing fractional/decimal values.
 
-### Step 2 — Identify Date Columns via Header Keywords and Content
-Evaluate every column in the dataset to select columns for date standardization:
+### Step 3 — Format Decimal Columns to Currency Strings
+For each identified currency column, format the values into standard USD currency strings:
+- Conversion format: `"${:,.2f}".format(x)` (producing outputs like `$1,250.50`).
+- Ensure null/NaN values remain blank rather than printing `$nan`.
+- Non-numeric or non-decimal columns must retain their original raw data and representations.
 
-1. **Header Keyword Match (Case-Insensitive):**
-   Check if the column name contains any of the following substrings:
-   - `date` (e.g., "Due Date", "Order_Date", "DATE")
-   - `start` (e.g., "Start Time", "Project Start", "actual_start")
-   - `finish` (e.g., "Finish Date", "Target Finish", "finish")
-   - `last modified` (e.g., "Last Modified", "last_modified_by_date", "Last Modified Date")
-   Any column containing one of these terms is **automatically designated** as a date column.
-
-2. **Automatic Pattern Detection (for other columns):**
-   For columns whose headers do not contain those keywords, sample non-empty values. If values resemble dates (e.g., `D-Mon-YY`, `M/D/YY`, `YYYY-MM-DD`, or timestamps), flag the column for conversion. Do not flag pure numeric columns (IDs, counters, currency).
-
-### Step 3 — Robust Cell-by-Cell Mixed Date Parsing
-Columns often contain mixed formats (e.g., `4-Sep-26` and `9/1/26` in the same column). Apply robust parsing to every cell in designated date columns:
-
-1. **Clean cell values:** Strip leading/trailing whitespace. If the cell is null, NaN, or an empty string, leave it as an empty string `""`.
-2. **Parse with US date convention & 2-digit year support:**
-   Use `python-dateutil.parser.parse(val, dayfirst=False)` or a robust fallback function:
-   - Handles short-month strings like `4-Sep-26` &rarr; `2026-09-04`.
-   - Handles slash dates like `9/1/26` &rarr; `2026-09-01` (interpreting `9` as Month, `1` as Day, `26` as 2026).
-   - Handles standard ISO dates and full timestamps (e.g., `2026-09-15 14:30:00` &rarr; `2026-09-15`).
-3. **Format string:** Output strictly `YYYY-MM-DD`.
-4. **Fallback for unparseable entries:** If an individual cell cannot be parsed into a date (e.g., text like "TBD", "N/A", or "Pending"), preserve the original cell text verbatim so no operational notes are destroyed.
-
-### Step 4 — Export Transformed Dataset to CSV
-Export the transformed table to a single CSV file:
-- Output filename: `[source_name]_[sheet_name]_standardized_dates.csv` (for Excel) or `[source_name]_standardized_dates.csv` (for CSV).
-- Use `index=False`, standard UTF-8 encoding, and standard CSV quoting.
-- Present a concise transformation summary table and provide the file download.
+### Step 4 — Export Single Sheet to CSV
+Write the transformed single sheet directly to a CSV file (e.g., `[sheet_name]_formatted.csv`) using UTF-8 encoding:
+- Set `index=False` during export to prevent writing arbitrary row indices.
+- Provide the generated CSV file download link and an execution summary to the user.
 
 ## Output format
 
-The final response must provide an execution summary table followed by the download file link:
+The response must provide a concise status table followed by the download file:
 
 | Metric / Parameter | Value |
 |---|---|
-| **Input File** | `[File Name]` |
-| **Input Type** | `Excel (Sheet: [Name])` OR `Standalone CSV` |
-| **Matched Date Columns** | `[List of columns identified and standardized]` |
-| **Trigger Reason** | `[Header Keyword Match / Pattern Detection]` |
-| **Output File** | `[Generated CSV Name]` |
+| **Source Workbook** | `[File Name]` |
+| **Extracted Sheet** | `[Sheet Name]` |
+| **Columns Formatted as Currency** | `[List of formatted columns]` |
+| **Excluded Columns (ID / Protected)** | `[List of skipped columns]` |
+| **Export Output** | `[Generated CSV File Name]` |
 
 Download: `[File download link / attachment]`
 
 ## Failure modes to watch for
 
-- **Crashing on mixed formats:** Do not rely on fixed-format parsers like `pd.to_datetime(col, format='%m/%d/%Y')`. Because a single column can have `4-Sep-26` and `9/1/26`, parse row-by-row or use flexible parsing with `dateutil.parser.parse(str(val), dayfirst=False)`.
-- **Interpreting 9/1/26 as January 9th:** Always enforce `dayfirst=False` so `9/1/26` is parsed as September 1, 2026.
-- **Converting 'TBD' or 'Pending' to NaT:** When a date column contains status notes, do not wipe them out. Keep the raw text if parsing fails.
-- **Exporting "NaT" into the CSV:** Ensure empty or null dates output as blank strings `""`, never literal `"NaT"`.
+- **Memory exhaustion from full workbook load:** Never use `openpyxl.load_workbook()` without `read_only=True` if inspecting sheets, and do not load all sheets at once. Only read the requested tab.
+- **Handling NaN/empty cells:** Ensure empty cells do not convert to string literals like `"$nan"` or `"$None"`. Leave them as empty strings in the CSV output.
+- **Breaking CSV commas:** When exporting to CSV, formatted currency values contain commas (e.g., `"$1,250.00"`). Ensure standard CSV quoting is maintained (`quoting=csv.QUOTE_MINIMAL` or default pandas CSV writing) so commas within currency strings do not split cells.
 
 ## When the input is unclear
 
-- **No file uploaded:** Prompt the user to upload either an Excel workbook (`.xlsx`, `.xlsm`) or a `.csv` file.
-- **Excel file uploaded without sheet name:** List all sheet names present in the workbook and ask the user which one they want to process.
-- **Excel sheet name mismatch:** Display the available sheet names found in the workbook and ask the user to verify their selection before proceeding.
+- **No file provided:** Prompt the user to upload the Excel workbook.
+- **No sheet specified:** Display the sheet names present in the uploaded file and prompt the user to select one.
+- **Specified sheet does not match:** If the sheet name is not found, list all available sheet names and request confirmation before running extraction.
 
 ## Why this design
 
-In project schedules and construction logs, dates are frequently entered by different teams resulting in mixed representations (`4-Sep-26`, `9/1/26`) within the exact same milestone or completion column. Explicitly targeting schedule headers (`date`, `start`, `finish`, `last modified`) paired with flexible, US-ordered datetime parsing ensures 100% capture of schedule dates without corrupting non-date text entries.
+Exporting directly to CSV bypasses the high CPU and RAM overhead of parsing, rendering, and re-serializing complex Excel XML trees, styles, and calculation chains across multiple sheets. This guarantees that large datasets complete within execution timeout limits while cleanly isolating the user's required data.
